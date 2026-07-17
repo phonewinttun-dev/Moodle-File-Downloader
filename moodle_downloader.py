@@ -23,6 +23,35 @@ from rich.progress import Progress, BarColumn, TextColumn, DownloadColumn, Trans
 from rich.layout import Layout
 from rich import box
 
+# --- Styled Progress Column subclasses for visual richness ---
+class StyledDownloadColumn(DownloadColumn):
+    def render(self, task):
+        text = super().render(task)
+        if isinstance(text, Text):
+            text.style = "bold yellow"
+        else:
+            text = Text(str(text), style="bold yellow")
+        return text
+
+class StyledTransferSpeedColumn(TransferSpeedColumn):
+    def render(self, task):
+        text = super().render(task)
+        if isinstance(text, Text):
+            text.style = "bold magenta"
+        else:
+            text = Text(str(text), style="bold magenta")
+        return text
+
+class StyledTimeRemainingColumn(TimeRemainingColumn):
+    def render(self, task):
+        text = super().render(task)
+        if isinstance(text, Text):
+            text.style = "bold blue"
+        else:
+            text = Text(str(text), style="bold blue")
+        return text
+
+
 # Ensure terminal outputs UTF-8 correctly
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -286,8 +315,8 @@ def make_dashboard_layout(start_time: float, status_text: str, processed_count: 
     # Active Jobs Table
     table = Table(expand=True, box=box.ROUNDED, border_style="blue")
     table.add_column("Worker", justify="center", width=10, style="bold magenta")
-    table.add_column("File Name", justify="left", ratio=4)
-    table.add_column("Destination Folder", justify="left", ratio=3)
+    table.add_column("File Name", justify="left", ratio=4, style="bold white")
+    table.add_column("Destination Folder", justify="left", ratio=3, style="dim cyan")
     table.add_column("Progress / Speed / ETA", justify="left", ratio=5)
 
     with active_jobs_lock:
@@ -302,16 +331,16 @@ def make_dashboard_layout(start_time: float, status_text: str, processed_count: 
                     dest = "..." + dest[-22:]
                 table.add_row(
                     f"Worker {idx+1}",
-                    filename,
-                    dest,
+                    Text(filename, style="bold green"),
+                    Text(dest, style="cyan"),
                     worker_progresses[idx]
                 )
             else:
                 table.add_row(
                     f"Worker {idx+1}",
-                    "[dim italic]Idle[/dim italic]",
-                    "-",
-                    "-"
+                    Text("Idle", style="dim italic"),
+                    Text("-", style="dim"),
+                    Text("-", style="dim")
                 )
 
     jobs_panel = Panel(table, title="[bold]Active Worker Streams[/bold]", border_style="blue")
@@ -326,13 +355,19 @@ def make_dashboard_layout(start_time: float, status_text: str, processed_count: 
     bar_width = 40
     filled = int(pct / 100 * bar_width)
     empty = bar_width - filled
-    bar_str = "=" * filled + ">" + "." * (empty - 1) if empty > 0 else "=" * filled
+    
+    # Modern heavy horizontal line progress bar
+    bar_str = "━" * filled + ("╸" if empty > 0 else "") + " " * (empty - 1 if empty > 0 else 0)
+    
     global_progress_text = Text.assemble(
-        ("Global: [", "white"),
-        (f"{bar_str}", "green" if pct == 100 else "yellow"),
-        (f"] {pct:.0f}% ({processed_count}/{total_count} Files Complete)", "white")
+        ("Global Progress: ", "bold white"),
+        ("[", "dim white"),
+        (f"{bar_str}", "bold green" if pct == 100 else "bold yellow"),
+        ("] ", "dim white"),
+        (f"{pct:.1f}%", "bold green" if pct == 100 else "bold yellow"),
+        (f" ({processed_count}/{total_count} Files Complete)", "white")
     )
-    global_panel = Panel(global_progress_text, border_style="green", box=box.ROUNDED)
+    global_panel = Panel(global_progress_text, border_style="green" if pct == 100 else "cyan", box=box.ROUNDED)
 
     layout = Layout()
     layout.split_column(
@@ -513,7 +548,7 @@ def select_course_sections(sections: list) -> list:
 # --- Core Executive main ---
 
 def main():
-    print(BANNER)
+    console.print(BANNER, style="bold cyan")
 
     parser = argparse.ArgumentParser(description="Download all contents of a Moodle course.")
     parser.add_argument("-u", "--url", help="Moodle course page URL or ID")
@@ -573,9 +608,9 @@ def main():
     if not auth_success:
         if not cookie_val and not (username and password):
             while True:
-                print("\nAuthentication Options:")
-                print("1) Enter MoodleSession Cookie (Recommended - bypasses captcha/SSO)")
-                print("2) Enter Username & Password")
+                console.print("\nAuthentication Options:", style="bold yellow")
+                console.print("1) Enter MoodleSession Cookie (Recommended - bypasses captcha/SSO)", style="green")
+                console.print("2) Enter Username & Password", style="green")
                 auth_choice = input("Select login method (1 or 2): ").strip()
 
                 if auth_choice == '1':
@@ -586,7 +621,7 @@ def main():
                     password = getpass.getpass("Password: ")
                     break
                 else:
-                    print("[!] Invalid option. Please select 1 or 2.")
+                    console.print("[!] Invalid option. Please select 1 or 2.", style="bold red")
 
         if cookie_val:
             console.print("[*] Injecting session cookie...", style="cyan")
@@ -634,11 +669,12 @@ def main():
     worker_progresses = []
     for _ in range(workers):
         progress = Progress(
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            BarColumn(bar_width=12),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            TimeRemainingColumn()
+            TextColumn("[bold green]{task.percentage:>3.0f}%"),
+            BarColumn(bar_width=12, style="bright_black", complete_style="bold green", finished_style="bold green"),
+            StyledDownloadColumn(),
+            StyledTransferSpeedColumn(),
+            StyledTimeRemainingColumn(),
+            console=console
         )
         worker_progresses.append(progress)
 
@@ -732,7 +768,7 @@ def main():
                 status_label = f"Check #{run_count} (Active)"
 
                 # Execution Live Layout Loop
-                with Live(make_dashboard_layout(start_time, status_label, 0, total_tasks, workers), screen=True, refresh_per_second=5) as live:
+                with Live(make_dashboard_layout(start_time, status_label, 0, total_tasks, workers), console=console, screen=True, refresh_per_second=5) as live:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                         futures = [executor.submit(worker_task, task, i % workers, session) for i, task in enumerate(download_tasks)]
 
@@ -750,14 +786,25 @@ def main():
                         for future in futures:
                             future.result()
 
-                # Summary View
-                print("\n==================================================")
-                print(f" Run #{run_count} Check Complete!")
-                print(f"   Downloaded (New):   {completed_files}")
-                print(f"   Skipped (Unchanged): {skipped_files}")
-                print(f"   Failed (Errors):    {failed_files}")
-                print(f"   Destination:        {os.path.abspath(output_dir)}")
-                print("==================================================")
+                # Summary View Panel
+                summary_table = Table.grid(padding=(0, 1))
+                summary_table.add_column(style="bold yellow")
+                summary_table.add_column(style="white")
+                summary_table.add_row("Downloaded (New):", f"[bold green]{completed_files}[/bold green]")
+                summary_table.add_row("Skipped (Unchanged):", f"[dim]{skipped_files}[/dim]")
+                summary_table.add_row("Failed (Errors):", f"[bold red]{failed_files}[/bold red]")
+                summary_table.add_row("Destination:", f"[cyan]{os.path.abspath(output_dir)}[/cyan]")
+
+                console.print()
+                console.print(
+                    Panel(
+                        summary_table,
+                        title=f"[bold green]Run #{run_count} Check Complete![/bold green]",
+                        border_style="green",
+                        box=box.ROUNDED,
+                        expand=False
+                    )
+                )
 
             if interval == 0:
                 break
@@ -766,7 +813,7 @@ def main():
             next_epoch = time.time() + interval * 60
             next_time_str = time.strftime('%H:%M:%S', time.localtime(next_epoch))
 
-            with Live(Panel(Text(""), border_style="cyan"), refresh_per_second=1) as live:
+            with Live(Panel(Text(""), border_style="cyan"), console=console, refresh_per_second=1) as live:
                 while time.time() < next_epoch:
                     remaining = int(next_epoch - time.time())
                     mins, secs = divmod(remaining, 60)
