@@ -269,6 +269,62 @@ def clean_filename(name: str) -> str:
     return name
 
 
+def extract_course_info(html_content: str) -> tuple[str, str | None]:
+    """Extracts course title and optional module code from course page HTML."""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Decompose hidden elements if any in title selectors
+    for hidden in soup.find_all(class_='accesshide'):
+        hidden.decompose()
+        
+    # Try different selectors to locate the course title
+    h1 = soup.select_one('.page-header-headings h1')
+    if not h1:
+        h1 = soup.select_one('header h1')
+    if not h1:
+        h1 = soup.select_one('.course-header h1')
+    
+    course_title = ""
+    if h1:
+        course_title = h1.get_text(strip=True)
+        
+    if not course_title:
+        # Fallback to <title> tag
+        title_tag = soup.title
+        if title_tag and title_tag.string:
+            title_str = title_tag.string.strip()
+            # Clean Moodle default format: "Course: Title" or "Course: Title | SiteName"
+            if "Course:" in title_str:
+                course_title = title_str.split("Course:", 1)[1].strip()
+            else:
+                course_title = title_str
+            # Remove site name suffix if present (e.g. " | UCSY Moodle" or " - UCSY")
+            if " | " in course_title:
+                course_title = course_title.split(" | ", 1)[0].strip()
+            elif " - " in course_title:
+                course_title = course_title.split(" - ", 1)[0].strip()
+                
+    if not course_title:
+        course_title = "Unknown Course"
+
+    # Extract module code from course_title before cleaning filename
+    # e.g., "IS-101 (Software Engineering)" -> "IS-101"
+    # Pattern: 1-4 letters, optional hyphen/space, 2-4 digits
+    pattern = r'\b([A-Za-z]{1,4}[- ]?\d{2,4})\b'
+    match = re.search(pattern, course_title)
+    
+    module_code = None
+    if match:
+        module_code = match.group(1).upper()
+        
+    # Now clean both values for safe directory naming
+    course_title = clean_filename(course_title)
+    if module_code:
+        module_code = clean_filename(module_code)
+        
+    return course_title, module_code
+
+
 # --- Thread-Safe State & UI Layout ---
 
 active_jobs = []
@@ -281,6 +337,7 @@ completed_files = 0
 skipped_files = 0
 failed_files = 0
 processed_files = 0
+failed_downloads = []
 global_lock = threading.Lock()
 
 worker_progresses = []
@@ -388,6 +445,8 @@ def download_item(session: MoodleSession, url: str, dest_path: str, worker_id: i
         response.raise_for_status()
     except Exception as e:
         safe_log(f"Connection failed: {url} -> {e}", "red")
+        with global_lock:
+            failed_downloads.append((url, f"Connection failed: {e}"))
         return "failed"
 
     final_url = response.url
@@ -417,9 +476,13 @@ def download_item(session: MoodleSession, url: str, dest_path: str, worker_id: i
                 return download_item(session, actual_url, dest_path, worker_id)
             else:
                 safe_log(f"Could not locate actual file URL in HTML wrapper: {url}", "yellow")
+                with global_lock:
+                    failed_downloads.append((url, "Could not locate actual file URL in HTML wrapper"))
                 return "failed"
         except Exception as e:
             safe_log(f"Failed parsing embed: {e}", "red")
+            with global_lock:
+                failed_downloads.append((url, f"Failed parsing HTML wrapper: {e}"))
             return "failed"
 
     # Parse standard file metadata
@@ -490,6 +553,8 @@ def download_item(session: MoodleSession, url: str, dest_path: str, worker_id: i
         return "downloaded"
     except Exception as e:
         safe_log(f"Write failed: {filename} -> {e}", "red")
+        with global_lock:
+            failed_downloads.append((filename, f"Write failed: {e}"))
         return "failed"
     finally:
         response.close()
@@ -714,6 +779,13 @@ def main():
                 time.sleep(30)
                 continue
 
+            # Extract course title and module code to organize folders
+            course_title, module_code = extract_course_info(html_content)
+            if module_code:
+                course_dest_dir = os.path.join(output_dir, module_code, course_title)
+            else:
+                course_dest_dir = os.path.join(output_dir, course_title)
+
             # Select target sections: Auto-select if non-interactive interval or yes flag is set
             if run_count == 1 and not auto_select_all and interval == 0:
                 selected_sections = select_course_sections(sections)
@@ -726,7 +798,7 @@ def main():
 
             for section in selected_sections:
                 sec_name = clean_filename(section['name'])
-                sec_dir = os.path.join(output_dir, sec_name)
+                sec_dir = os.path.join(course_dest_dir, sec_name)
 
                 for item in section['items']:
                     if item['type'] == 'resource':
@@ -754,12 +826,13 @@ def main():
                 console.print("[+] No resources or files available to download.", style="green")
             else:
                 # Reset counts
-                global completed_files, skipped_files, failed_files, processed_files
+                global completed_files, skipped_files, failed_files, processed_files, failed_downloads
                 with global_lock:
                     completed_files = 0
                     skipped_files = 0
                     failed_files = 0
                     processed_files = 0
+                    failed_downloads = []
 
                 with log_lock:
                     log_messages.clear()
@@ -793,7 +866,7 @@ def main():
                 summary_table.add_row("Downloaded (New):", f"[bold green]{completed_files}[/bold green]")
                 summary_table.add_row("Skipped (Unchanged):", f"[dim]{skipped_files}[/dim]")
                 summary_table.add_row("Failed (Errors):", f"[bold red]{failed_files}[/bold red]")
-                summary_table.add_row("Destination:", f"[cyan]{os.path.abspath(output_dir)}[/cyan]")
+                summary_table.add_row("Destination:", f"[cyan]{os.path.abspath(course_dest_dir)}[/cyan]")
 
                 console.print()
                 console.print(
@@ -805,6 +878,26 @@ def main():
                         expand=False
                     )
                 )
+
+                # Print failed downloads detail if any
+                with global_lock:
+                    fails = list(failed_downloads)
+                if fails:
+                    fail_table = Table(box=box.ROUNDED, border_style="red", expand=False)
+                    fail_table.add_column("Resource / File / URL", style="bold red")
+                    fail_table.add_column("Reason for Failure", style="white")
+                    for item_name, reason in fails:
+                        fail_table.add_row(item_name, reason)
+                    
+                    console.print()
+                    console.print(
+                        Panel(
+                            fail_table,
+                            title="[bold red]Failed Downloads Detail[/bold red]",
+                            border_style="red",
+                            expand=False
+                        )
+                    )
 
             if interval == 0:
                 break
