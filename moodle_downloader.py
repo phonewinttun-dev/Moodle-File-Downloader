@@ -342,6 +342,8 @@ failed_downloads = []
 global_lock = threading.Lock()
 
 worker_progresses = []
+shutdown_flag = threading.Event()
+
 
 
 def safe_log(msg: str, style: str = None):
@@ -441,6 +443,8 @@ def make_dashboard_layout(start_time: float, status_text: str, processed_count: 
 
 def download_item(session: MoodleSession, url: str, dest_path: str, worker_id: int) -> str:
     """Streams file download and checks for redirects/embeds. Returns status."""
+    if shutdown_flag.is_set():
+        return "failed"
     try:
         response = session.get(url, stream=True, allow_redirects=True, timeout=20)
         response.raise_for_status()
@@ -448,6 +452,10 @@ def download_item(session: MoodleSession, url: str, dest_path: str, worker_id: i
         safe_log(f"Connection failed: {url} -> {e}", "red")
         with global_lock:
             failed_downloads.append((url, f"Connection failed: {e}"))
+        return "failed"
+
+    if shutdown_flag.is_set():
+        response.close()
         return "failed"
 
     final_url = response.url
@@ -546,6 +554,14 @@ def download_item(session: MoodleSession, url: str, dest_path: str, worker_id: i
     try:
         with open(full_dest, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
+                if shutdown_flag.is_set():
+                    f.close()
+                    try:
+                        if os.path.exists(full_dest):
+                            os.remove(full_dest)
+                    except Exception:
+                        pass
+                    return "failed"
                 if chunk:
                     f.write(chunk)
                     prog.update(task_id, advance=len(chunk))
@@ -571,7 +587,12 @@ def worker_task(task: dict, worker_id_queue: queue.Queue, session: MoodleSession
     
     worker_id = worker_id_queue.get()
     try:
-        status = download_item(session, url, dest, worker_id)
+        if shutdown_flag.is_set():
+            status = "failed"
+            with global_lock:
+                failed_downloads.append((url, "Cancelled by user"))
+        else:
+            status = download_item(session, url, dest, worker_id)
     finally:
         worker_id_queue.put(worker_id)
         worker_id_queue.task_done()
@@ -587,6 +608,22 @@ def worker_task(task: dict, worker_id_queue: queue.Queue, session: MoodleSession
 
 
 # --- Interactive CLI Helper ---
+
+def validate_course_url(url: str) -> str | None:
+    """Validates Moodle course URL and returns formatted URL or None if invalid."""
+    url = url.strip()
+    if not url:
+        return None
+    if url.isdigit():
+        url = f"https://moodle.ucsy.edu.mm/course/view.php?id={url}"
+    
+    parsed = urllib.parse.urlparse(url)
+    if not (parsed.scheme and parsed.netloc):
+        return None
+    if 'id=' not in url:
+        return None
+    return url
+
 
 def select_course_sections(sections: list) -> list:
     """Displays terminal checkbox menu for user section selection."""
@@ -609,149 +646,181 @@ def select_course_sections(sections: list) -> list:
         ).execute()
 
         if not result:
-            console.print("[-] No sections selected. Exiting.", style="red")
-            sys.exit(0)
+            return []
         return result
     except KeyboardInterrupt:
-        console.print("\n[!] Selection cancelled. Exiting.", style="yellow")
-        sys.exit(0)
+        raise KeyboardInterrupt
 
 
-# --- Core Executive main ---
+# --- Core Executive Flow ---
 
-def main():
-    console.print(BANNER, style="bold cyan")
+def run_download_workflow(course_url=None, cookie_val=None, username=None, password=None, output_dir="./moodle_downloads", workers=None, interval=0, auto_select_all=False):
+    """Executes the interactive workflow for course downloading."""
+    global active_jobs, worker_progresses, completed_files, skipped_files, failed_files, processed_files, failed_downloads, shutdown_flag
+    
+    # Reset shutdown event
+    shutdown_flag.clear()
+    
+    is_interactive = (course_url is None)
 
-    parser = argparse.ArgumentParser(description="Download all contents of a Moodle course.")
-    parser.add_argument("-u", "--url", help="Moodle course page URL or ID")
-    parser.add_argument("-c", "--cookie", help="MoodleSession cookie value")
-    parser.add_argument("-o", "--output", default="./moodle_downloads", help="Output directory to save downloads")
-    parser.add_argument("-w", "--workers", type=int, help="Number of concurrent download workers")
-    parser.add_argument("-i", "--interval", type=int, help="Check interval in minutes (if set, script runs periodically)")
-    parser.add_argument("-y", "--all", action="store_true", help="Auto-select all sections (bypass selection menu)")
-    parser.add_argument("--username", help="Moodle username")
-    parser.add_argument("--password", help="Moodle password")
-
-    args = parser.parse_args()
-
-    course_url = args.url
-    cookie_val = args.cookie
-    username = args.username
-    password = args.password
-    output_dir = args.output
-    workers = args.workers
-    interval = args.interval
-    auto_select_all = args.all
-
-    if not course_url:
-        course_url = input("Enter Moodle Course URL (or ID, e.g. 209): ").strip()
-
-    if course_url.isdigit():
-        course_url = f"https://moodle.ucsy.edu.mm/course/view.php?id={course_url}"
-    elif 'id=' not in course_url:
-        console.print("[-] Invalid Course URL. Must contain a course ID (?id=...)", style="red")
-        return 1
-
-    parsed_url = urllib.parse.urlparse(course_url)
-    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-
-    session = MoodleSession(base_url)
-    auth_success = False
-
-    # 1. Try Cookie Caching Load
-    cached = load_cached_session(course_url)
-    if cached and not cookie_val and not (username and password):
-        console.print("[*] Found cached session. Checking validity...", style="cyan")
-        session.inject_cookies(cached["cookies"])
-        try:
-            res = session.get(course_url, allow_redirects=True, timeout=15)
-            if "login/index.php" not in res.url:
-                auth_success = True
-                username = cached.get("username", "Cached User")
-                console.print(f"[+] Re-used valid session cache for user: {username}", style="green")
-            else:
-                console.print("[-] Cached session expired.", style="yellow")
-                clear_session_cache()
-        except Exception:
-            console.print("[-] Failed connecting with cached session.", style="yellow")
-            clear_session_cache()
-
-    # 2. Command Line or Interactive Auth Flow
-    if not auth_success:
-        if not cookie_val and not (username and password):
-            while True:
-                console.print("\nAuthentication Options:", style="bold yellow")
-                console.print("1) Enter MoodleSession Cookie (Recommended - bypasses captcha/SSO)", style="green")
-                console.print("2) Enter Username & Password", style="green")
-                auth_choice = input("Select login method (1 or 2): ").strip()
-
-                if auth_choice == '1':
-                    cookie_val = input("MoodleSession Cookie: ").strip()
-                    break
-                elif auth_choice == '2':
-                    username = input("Username: ").strip()
-                    password = getpass.getpass("Password: ")
-                    break
-                else:
-                    console.print("[!] Invalid option. Please select 1 or 2.", style="bold red")
-
-        if cookie_val:
-            console.print("[*] Injecting session cookie...", style="cyan")
-            session.set_cookie(cookie_val)
-            auth_success = True
-        elif username and password:
-            console.print(f"[*] Authenticating as '{username}'...", style="cyan")
-            success, msg = session.login(username, password)
-            if success:
-                console.print(f"[+] {msg}", style="green")
-                auth_success = True
-                # Cache successful session cookies
-                save_session_cache(course_url, session.session.cookies.get_dict(), username)
-            else:
-                console.print(f"[-] {msg}", style="red")
-                return 1
-
-    if not auth_success:
-        console.print("[-] Authentication failed. Exiting.", style="red")
-        return 1
-
-    # 3. Choose running interval
-    if interval is None:
-        ans = input("Would you like this script to run periodically to check for updates? (y/n, default: n): ").strip().lower()
-        if ans == 'y':
-            try:
-                val = input("Enter check interval in minutes (default: 10): ").strip()
-                interval = int(val) if val else 10
-            except ValueError:
-                interval = 10
-        else:
-            interval = 0
-
-    # 4. Initialize concurrency workers
-    if workers is None:
-        ans = input(f"Would you like to download files in parallel? (y/n, default: y): ").strip().lower()
-        if ans == 'n':
-            workers = 1
-        else:
-            workers = 4
-
-    # Initialize shared states
-    global active_jobs, worker_progresses
-    active_jobs = [None] * workers
-    worker_progresses = []
-    for _ in range(workers):
-        progress = Progress(
-            TextColumn("[bold green]{task.percentage:>3.0f}%"),
-            BarColumn(bar_width=12, style="bright_black", complete_style="bold green", finished_style="bold green"),
-            StyledDownloadColumn(),
-            StyledTransferSpeedColumn(),
-            StyledTimeRemainingColumn(),
-            console=console
-        )
-        worker_progresses.append(progress)
-
-    run_count = 0
     try:
+        # Step 1: Course URL
+        if not course_url:
+            while True:
+                try:
+                    course_url_input = input("Enter the Moodle course URL: ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    raise KeyboardInterrupt
+                
+                validated = validate_course_url(course_url_input)
+                if validated:
+                    course_url = validated
+                    break
+                console.print("[-] Invalid Course URL. Please enter a valid Moodle course URL (must contain '?id=...').", style="red")
+
+        parsed_url = urllib.parse.urlparse(course_url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+        session = MoodleSession(base_url)
+        auth_success = False
+
+        # Try to load cached session first
+        cached = load_cached_session(course_url)
+        if cached and not cookie_val and not (username and password):
+            console.print("[*] Found cached session. Checking validity...", style="cyan")
+            session.inject_cookies(cached["cookies"])
+            try:
+                res = session.get(course_url, allow_redirects=True, timeout=15)
+                if "login/index.php" not in res.url:
+                    if is_interactive:
+                        while True:
+                            try:
+                                ans = input(f"Found cached session for user: {cached.get('username', 'Cached User')}. Re-use? (Y/n): ").strip().lower()
+                            except (KeyboardInterrupt, EOFError):
+                                raise KeyboardInterrupt
+                            if ans in ('', 'y', 'yes'):
+                                auth_success = True
+                                username = cached.get("username", "Cached User")
+                                console.print(f"[+] Re-used valid session cache for user: {username}", style="green")
+                                break
+                            elif ans in ('n', 'no'):
+                                clear_session_cache()
+                                break
+                            else:
+                                console.print("[!] Invalid option. Please enter 'y' for Yes or 'n' for No.", style="red")
+                    else:
+                        auth_success = True
+                        username = cached.get("username", "Cached User")
+                        console.print(f"[+] Re-used valid session cache for user: {username}", style="green")
+                else:
+                    console.print("[-] Cached session expired.", style="yellow")
+                    clear_session_cache()
+            except Exception:
+                console.print("[-] Failed connecting with cached session.", style="yellow")
+                clear_session_cache()
+
+        # Step 2: Authentication Method
+        if not auth_success:
+            if not cookie_val and not (username and password):
+                if not is_interactive:
+                    console.print("[-] No credentials or cookie provided for non-interactive run.", style="red")
+                    return False
+
+                while True:
+                    console.print("\nAuthentication Options:", style="bold yellow")
+                    console.print("1. Moodle Email & Password", style="green")
+                    console.print("2. MoodleSession Cookie", style="green")
+                    try:
+                        auth_choice = input("Select login method (1 or 2): ").strip()
+                    except (KeyboardInterrupt, EOFError):
+                        raise KeyboardInterrupt
+
+                    if auth_choice == '1':
+                        while True:
+                            try:
+                                username = input("Enter Moodle Email: ").strip()
+                                if username:
+                                    break
+                                console.print("[-] Email cannot be empty.", style="red")
+                            except (KeyboardInterrupt, EOFError):
+                                raise KeyboardInterrupt
+                        while True:
+                            try:
+                                password = getpass.getpass("Enter Moodle Password: ")
+                                if password:
+                                    break
+                                console.print("[-] Password cannot be empty.", style="red")
+                            except (KeyboardInterrupt, EOFError):
+                                raise KeyboardInterrupt
+                        break
+                    elif auth_choice == '2':
+                        while True:
+                            try:
+                                cookie_val = input("Enter MoodleSession Cookie: ").strip()
+                                if cookie_val:
+                                    break
+                                console.print("[-] Cookie cannot be empty.", style="red")
+                            except (KeyboardInterrupt, EOFError):
+                                raise KeyboardInterrupt
+                        break
+                    else:
+                        console.print("[!] Invalid option. Please select 1 or 2.", style="bold red")
+
+            if cookie_val:
+                console.print("[*] Injecting session cookie...", style="cyan")
+                session.set_cookie(cookie_val)
+                auth_success = True
+            elif username and password:
+                console.print(f"[*] Authenticating as '{username}'...", style="cyan")
+                success, msg = session.login(username, password)
+                if success:
+                    console.print(f"[+] {msg}", style="green")
+                    auth_success = True
+                    save_session_cache(course_url, session.session.cookies.get_dict(), username)
+                else:
+                    console.print(f"[-] {msg}", style="red")
+                    time.sleep(2)
+                    return False
+
+        if not auth_success:
+            console.print("[-] Authentication failed.", style="red")
+            time.sleep(2)
+            return False
+
+        # Step 3: Concurrency Preference
+        if workers is None:
+            if not is_interactive:
+                workers = 4  # Default to parallel for non-interactive
+            else:
+                while True:
+                    try:
+                        ans = input("Download files in parallel? (Y/n): ").strip().lower()
+                    except (KeyboardInterrupt, EOFError):
+                        raise KeyboardInterrupt
+                    if ans in ('', 'y', 'yes'):
+                        workers = 4
+                        break
+                    elif ans in ('n', 'no'):
+                        workers = 1
+                        break
+                    else:
+                        console.print("[!] Invalid input. Please enter 'y' for Yes or 'n' for No.", style="red")
+
+        # Setup progress indicators
+        active_jobs = [None] * workers
+        worker_progresses = []
+        for _ in range(workers):
+            progress = Progress(
+                TextColumn("[bold green]{task.percentage:>3.0f}%"),
+                BarColumn(bar_width=12, style="bright_black", complete_style="bold green", finished_style="bold green"),
+                StyledDownloadColumn(),
+                StyledTransferSpeedColumn(),
+                StyledTimeRemainingColumn(),
+                console=console
+            )
+            worker_progresses.append(progress)
+
+        run_count = 0
         while True:
             run_count += 1
             console.print(f"[*] Fetching course content structure...", style="cyan")
@@ -764,16 +833,19 @@ def main():
                         if success:
                             res = session.get(course_url, timeout=20)
                         else:
-                            console.print("[-] Re-authentication failed. Exiting.", style="red")
-                            return 1
+                            console.print("[-] Re-authentication failed.", style="red")
+                            time.sleep(2)
+                            return False
                     else:
-                        console.print("[-] Re-authentication unavailable without credentials. Exiting.", style="red")
-                        return 1
+                        console.print("[-] Re-authentication unavailable without credentials.", style="red")
+                        time.sleep(2)
+                        return False
                 html_content = res.text
             except Exception as e:
                 console.print(f"[-] Network connection error: {e}", style="red")
                 if interval == 0:
-                    return 1
+                    time.sleep(2)
+                    return False
                 time.sleep(30)
                 continue
 
@@ -782,7 +854,8 @@ def main():
             if not sections:
                 console.print("[-] Course metadata parsing failed or course has no sections.", style="red")
                 if interval == 0:
-                    return 1
+                    time.sleep(2)
+                    return False
                 time.sleep(30)
                 continue
 
@@ -793,9 +866,13 @@ def main():
             else:
                 course_dest_dir = os.path.join(output_dir, course_title)
 
-            # Select target sections: Auto-select if non-interactive interval or yes flag is set
+            # Select target sections
             if run_count == 1 and not auto_select_all and interval == 0:
                 selected_sections = select_course_sections(sections)
+                if not selected_sections:
+                    console.print("[*] No sections selected. Returning to main menu.", style="yellow")
+                    time.sleep(1.5)
+                    return False
             else:
                 selected_sections = sections
 
@@ -804,10 +881,14 @@ def main():
             download_tasks = []
 
             for section in selected_sections:
+                if shutdown_flag.is_set():
+                    break
                 sec_name = clean_filename(section['name'])
                 sec_dir = os.path.join(course_dest_dir, sec_name)
 
                 for item in section['items']:
+                    if shutdown_flag.is_set():
+                        break
                     if item['type'] == 'resource':
                         download_tasks.append({
                             'url': item['url'],
@@ -828,12 +909,14 @@ def main():
                         except Exception as e:
                             console.print(f"  [!] Skipping folder '{item['name']}': {e}", style="yellow")
 
+            if shutdown_flag.is_set():
+                raise KeyboardInterrupt
+
             total_tasks = len(download_tasks)
             if total_tasks == 0:
                 console.print("[+] No resources or files available to download.", style="green")
             else:
                 # Reset counts
-                global completed_files, skipped_files, failed_files, processed_files, failed_downloads
                 with global_lock:
                     completed_files = 0
                     skipped_files = 0
@@ -856,15 +939,24 @@ def main():
                     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                         futures = [executor.submit(worker_task, task, worker_id_queue, session) for task in download_tasks]
 
-                        while True:
-                            with global_lock:
-                                current_processed = processed_files
+                        try:
+                            while True:
+                                with global_lock:
+                                    current_processed = processed_files
 
-                            live.update(make_dashboard_layout(start_time, status_label, current_processed, total_tasks, workers))
+                                live.update(make_dashboard_layout(start_time, status_label, current_processed, total_tasks, workers))
 
-                            if current_processed == total_tasks:
-                                break
-                            time.sleep(0.2)
+                                if current_processed == total_tasks:
+                                    break
+                                if shutdown_flag.is_set():
+                                    raise KeyboardInterrupt
+                                time.sleep(0.2)
+                        except KeyboardInterrupt:
+                            shutdown_flag.set()
+                            for future in futures:
+                                future.cancel()
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            raise
 
                         # Propagate exceptions if any occurred in background threads
                         for future in futures:
@@ -911,6 +1003,11 @@ def main():
                     )
 
             if interval == 0:
+                if is_interactive:
+                    try:
+                        input("\nPress Enter to return to the Main Menu...")
+                    except (KeyboardInterrupt, EOFError):
+                        raise KeyboardInterrupt
                 break
 
             # Countdown Timer inside Live block for periodic checks
@@ -919,6 +1016,8 @@ def main():
 
             with Live(Panel(Text(""), border_style="cyan"), console=console, refresh_per_second=1) as live:
                 while time.time() < next_epoch:
+                    if shutdown_flag.is_set():
+                        raise KeyboardInterrupt
                     remaining = int(next_epoch - time.time())
                     mins, secs = divmod(remaining, 60)
                     countdown_text = Text.assemble(
@@ -931,9 +1030,81 @@ def main():
                     time.sleep(1)
 
     except KeyboardInterrupt:
-        console.print("\n[!] Execution stopped by user. Goodbye!", style="bold yellow")
+        shutdown_flag.set()
+        if 'futures' in locals():
+            for future in futures:
+                future.cancel()
+        if 'executor' in locals():
+            executor.shutdown(wait=False, cancel_futures=True)
+        
+        console.print("\nDownload stopped.", style="bold red")
+        time.sleep(2)
+        return False
+
+    return True
+
+
+def main_menu_loop():
+    """Main menu loop offering option to download or exit."""
+    while True:
+        # Clear terminal screen
+        os.system('cls' if os.name == 'nt' else 'clear')
+        
+        # Display banner & menu
+        console.print(BANNER, style="bold cyan")
+        console.print("Main Menu:", style="bold yellow")
+        console.print("1. Download Course Contents", style="green")
+        console.print("2. Exit", style="green")
+        console.print()
+        
+        try:
+            choice = input("Select an option (1-2): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\nExiting program. Goodbye!", style="bold yellow")
+            sys.exit(0)
+            
+        if choice == '1':
+            run_download_workflow()
+        elif choice == '2':
+            console.print("Exiting program. Goodbye!", style="bold yellow")
+            sys.exit(0)
+        else:
+            console.print("[!] Invalid option. Please select 1 or 2.", style="bold red")
+            time.sleep(1.5)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Download all contents of a Moodle course.")
+    parser.add_argument("-u", "--url", help="Moodle course page URL or ID")
+    parser.add_argument("-c", "--cookie", help="MoodleSession cookie value")
+    parser.add_argument("-o", "--output", default="./moodle_downloads", help="Output directory to save downloads")
+    parser.add_argument("-w", "--workers", type=int, help="Number of concurrent download workers")
+    parser.add_argument("-i", "--interval", type=int, help="Check interval in minutes (if set, script runs periodically)")
+    parser.add_argument("-y", "--all", action="store_true", help="Auto-select all sections (bypass selection menu)")
+    parser.add_argument("--username", help="Moodle username")
+    parser.add_argument("--password", help="Moodle password")
+
+    args = parser.parse_args()
+
+    # Check if arguments were provided (e.g. at least one arg besides script name)
+    if len(sys.argv) > 1:
+        # Non-interactive mode using parsed arguments
+        success = run_download_workflow(
+            course_url=args.url,
+            cookie_val=args.cookie,
+            username=args.username,
+            password=args.password,
+            output_dir=args.output,
+            workers=args.workers,
+            interval=args.interval if args.interval is not None else 0,
+            auto_select_all=args.all
+        )
+        return 0 if success else 1
+    else:
+        # Interactive Mode
+        main_menu_loop()
         return 0
-    return 0
+
 
 if __name__ == '__main__':
     try:
