@@ -10,6 +10,7 @@ import collections
 import urllib.parse
 import posixpath
 import concurrent.futures
+import queue
 
 import requests
 from bs4 import BeautifulSoup
@@ -562,12 +563,18 @@ def download_item(session: MoodleSession, url: str, dest_path: str, worker_id: i
             active_jobs[worker_id] = None
 
 
-def worker_task(task: dict, worker_id: int, session: MoodleSession):
+def worker_task(task: dict, worker_id_queue: queue.Queue, session: MoodleSession):
     """Executes single task wrapper with thread-safe counters."""
     global completed_files, skipped_files, failed_files, processed_files
     url = task['url']
     dest = task['dest']
-    status = download_item(session, url, dest, worker_id)
+    
+    worker_id = worker_id_queue.get()
+    try:
+        status = download_item(session, url, dest, worker_id)
+    finally:
+        worker_id_queue.put(worker_id)
+        worker_id_queue.task_done()
 
     with global_lock:
         processed_files += 1
@@ -842,8 +849,12 @@ def main():
 
                 # Execution Live Layout Loop
                 with Live(make_dashboard_layout(start_time, status_label, 0, total_tasks, workers), console=console, screen=True, refresh_per_second=5) as live:
+                    worker_id_queue = queue.Queue()
+                    for idx in range(workers):
+                        worker_id_queue.put(idx)
+
                     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                        futures = [executor.submit(worker_task, task, i % workers, session) for i, task in enumerate(download_tasks)]
+                        futures = [executor.submit(worker_task, task, worker_id_queue, session) for task in download_tasks]
 
                         while True:
                             with global_lock:
